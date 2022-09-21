@@ -1,6 +1,6 @@
 ## Supply Chain Automation
 
-This example contains the cloud formation template to create AWS resources (AWS IoT Core, Amazon Location Service, Amazon RDS, Amazon EventBridge, AWS Lambda, Amazon SES), and code assets for AWS Lambda. Scripts to create the database schema and sample data. GeoJSON files for creating the geofences.
+This example contains CloudFormation template that creates AWS resources (AWS IoT Core, Amazon Location Service, Amazon RDS, Amazon EventBridge, AWS Lambda, Amazon SES). Scripts to create database schema and import sample data. GeoJSON files for creating geofences.
 
 The scripts to create table schemas and sample data can be found [here](dbscripts/db_scripts.sql)
 
@@ -10,7 +10,7 @@ The cloudFormation stack includes three Lambda functions. The details are as fol
 
 **vcs-iot-messageparser**
 
-Processing events from IoT and performing the following actions.
+For processing events from IoT and performing the following actions.
 1.	Validate the vehicle information 
 2.	Update the vehicle's current Status
 
