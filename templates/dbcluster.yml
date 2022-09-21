@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation Sample Template AuroraServerlessDBCluster: Sample template
+  showing how to create an Amazon Aurora Serverless DB cluster. **WARNING** This
+  template creates an Amazon Aurora DB cluster. You will be billed for the AWS
+  resources used if you create a stack from this template.
+Parameters:
+  PrivateSubnetA:
+    Description: Private Subnet 1
+    Type: String
+  PrivateSubnetB:
+    Description: Private Subnet 1
+    Type: String
+  VPCId:
+    Description: VPCId
+    Type: String
+  NoIngressSecurityGroup:
+    Description: No Ingress Security Group created as part of VPC
+    Type: String
+Resources:
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Database
+      GroupName: DatabaseSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref NoIngressSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref NoIngressSecurityGroup
+      VpcId: !Ref VPCId
+  SubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: A Subnet Group for our database
+      DBSubnetGroupName: DealerDBSubnetGroup
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+  RDSSecret:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Description: "This is a Secrets Manager secret for an RDS DB instance"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "dbadmin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+  RDSCluster:
+    Type: 'AWS::RDS::DBCluster'
+    Properties:
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecret, ':SecretString:password}}' ]]
+      DBClusterIdentifier: supplychain-cluster
+      DBSubnetGroupName: !Ref SubnetGroup
+      EnableHttpEndpoint: True
+      DatabaseName: vcsmaster
+      Engine: aurora-postgresql
+      EngineVersion: 10.18
+      EngineMode: serverless
+      StorageEncrypted: true
+      DeletionProtection: true
+      VpcSecurityGroupIds:
+        - !GetAtt DBSecurityGroup.GroupId
+      ScalingConfiguration:
+        AutoPause: true
+        MinCapacity: 4
+        MaxCapacity: 32
+        SecondsUntilAutoPause: 1000
+  SecretRDSInstanceAttachment:
+    Type: "AWS::SecretsManager::SecretTargetAttachment"
+    Properties:
+      SecretId: !Ref RDSSecret
+      TargetId: !Ref RDSCluster
+      TargetType: AWS::RDS::DBCluster
+Outputs:
+  SecretARN:
+    Description: A reference to the secret created. Needed for Query Editor
+    Value: !Ref RDSSecret

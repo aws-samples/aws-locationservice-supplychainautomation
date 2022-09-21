@@ -1,0 +1,28 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "geofence01",
+        "Name": "dealer01",
+        "DealerId": "dealer01",
+        "City": "Frisco",
+        "Zipcode": "75024",
+        "Country": "Unites States"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-96.82403326034546, 33.06841980033991],
+            [-96.8241834640503, 33.06559658897117],
+            [-96.81877613067627, 33.065686501557565],
+            [-96.81888341903687, 33.06858163773721],
+            [-96.82403326034546, 33.06841980033991]
+          ]
+        ]
+      }
+    }
+  ]
+}

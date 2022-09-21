@@ -1,0 +1,14 @@
+Description:  This template deploys stack sets for a VPC, DB Cluster, and Lambda Functions.
+Parameters:
+  EmailAddress:
+    Description: Email address used for sending emails
+    Type: String
+Resources:
+  SESEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref EmailAddress
+Outputs:
+  SESEmailIdentity:
+    Description: SES Email Identity Created for Dealer Tracking
+    Value: !Ref SESEmailIdentity

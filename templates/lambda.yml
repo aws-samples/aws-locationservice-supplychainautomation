@@ -1,0 +1,621 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+
+Parameters:
+  SecretARN:
+    Description: ARN of Database Secret
+    Type: String
+  EmailId:
+    Description: Email identity ID
+    Type: String
+  PrivateSubnetA:
+    Description: Subnet for Lambda Deployment
+    Type: String
+  PrivateSubnetB:
+    Description: Subnet for Lambda Deployment
+    Type: String
+  NoIngressSecurityGroup:
+    Description: Security Group for Lambda
+    Type: String
+Resources:
+  IotCoreRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: UpdateDBFromMQTT
+      TopicRulePayload:
+        Description: Rule to send MQTT messages to Database
+        Sql: "SELECT * FROM 'iot/fleet/location'"
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt MessageParserFunction.Arn
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MessageParserFunction
+      Principal: iot.amazonaws.com
+  IotSimulatorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: IotSimulatorFunctionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - iot:Publish
+            Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/iot/fleet/location'
+
+  MessageParserFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: MessageParserPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - geo:BatchUpdateDevicePosition
+            Resource: !Sub 'arn:aws:geo:${AWS::Region}:${AWS::AccountId}:tracker/tracker-01'
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:ListSecretVersionIds
+            Resource: !Ref SecretARN
+  EventParserFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: MessageParserPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:ListSecretVersionIds
+            Resource: !Ref SecretARN
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: !Join
+                      - ''
+                      - - 'arn:aws:ses:'
+                        - !Sub '${AWS::Region}'
+                        - ':'
+                        - !Sub '${AWS::AccountId}'
+                        - ':identity/'
+                        - !Ref EmailId
+  MessageParserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import datetime
+          import psycopg2
+          import json
+          import boto3
+          import logging
+          import sys
+          import time
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          TRACKER_NAME = "tracker-01"
+          SECRET_ID = os.environ['SecretARN']
+
+          client_sm = boto3.client('secretsmanager')
+          response = client_sm.get_secret_value(
+              SecretId=SECRET_ID
+          )
+          db_conn = json.loads(response['SecretString'])
+
+          ENDPOINT = db_conn['host']
+          PORT = db_conn['port']
+          USER = db_conn['username']
+          REGION = os.environ['AWS_REGION']
+          DBNAME = "vcsmaster"
+          DBPWD = db_conn['password']
+
+          # ********* create the connection for the database
+          try:
+              conn = psycopg2.connect(host=ENDPOINT, port=PORT, database=DBNAME, user=USER,
+                                      password=DBPWD)
+          except psycopg2.Error as e:
+              logger.error("Database connection failed due to {}".format(e))
+              logger.error(e)
+              sys.exit()
+
+          logger.info("OUTCOME: Connection to RDS instance succeeded")
+
+
+          def lambda_handler(event, context):
+
+              vehicle_id = event["vehicleid"]
+              event_id = event["eventid"]
+              event_tstamp = event["timestamp"]
+              event_position = event["position"]
+              forward_event = False
+
+              # ********* verify the vehicle information from the database and its sold status
+              logger.info(
+                  "ACTION: Checking if the vehicle exists in back end and if so check status to see if its not sold")
+              cur = conn.cursor()
+              select_query = "SELECT v.*, c.customerid FROM vehicles v LEFT JOIN customervehicles c ON v.vehicleid=c.vehicleid where v.vehicleid = %s"
+              cur.execute(select_query, (vehicle_id,))
+              vehicle_records = cur.fetchall()
+              vehicle_records_count = len(vehicle_records)
+              logger.info("OUTCOME: Total rocords that matches the vehicle id: %s",
+                          vehicle_records_count)
+
+              if vehicle_records_count == 1:
+                  customer_id = vehicle_records[0][11]
+
+                  if(customer_id is None):
+                      forward_event = True
+
+                      # ********* Create vehicle if not exists for updating the vehicle status
+                      try:
+                          iq_02 = """ INSERT INTO vehiclestatus(vehicleid) VALUES (%s);"""
+                          cur.execute(iq_02, (vehicle_id,))
+                          conn.commit()
+                      except:
+                          logger.error("Vehicle insert error")
+                          conn.rollback()
+
+                      # ********* Update the vehicle status and last known position
+                      logger.info(
+                          "ACTION: Updating the vehicle's in-transit status and its last known position")
+                      update_v_01 = "UPDATE vehiclestatus SET intransit=%s, lastposition=point(%s, %s), lastpositiontstamp=%s, longitude=%s, latitude=%s WHERE vehicleid = %s;"
+                      cur.execute(
+                          update_v_01, (True, event_position[0], event_position[1], event_tstamp, event_position[0], event_position[1], vehicle_id))
+                      conn.commit()
+
+                      # ********* Insert vehicle telemetry
+                      try:
+                          logger.info('ACTION: Save the geofence event into database')
+                          cur = conn.cursor()
+                          iq_01 = """ INSERT INTO public.positionevents(
+                                      time, vehicleid, eventid,  longitude, latitude,position)
+                                      VALUES
+                                      (%s, %s, %s, %s, %s, point(%s,%s));"""
+                          cur.execute(iq_01, (event_tstamp, vehicle_id, event_id,
+                                              event_position[0], event_position[1], event_position[0], event_position[1]))
+                          conn.commit()
+                      except:
+                          logger.error("Vehicle insert error")
+                          conn.rollback()
+
+              else:
+                  logger.info("OUTCOME: Vehicle does not exists in the backend.")
+
+              if forward_event:
+
+
+                  # ********* Forward the location information to the amazon location service
+                  curr_datetime = datetime.datetime.utcnow()
+                  curr_datetime_iso = curr_datetime.isoformat()
+
+                  updates = [
+                      {
+                          "DeviceId": vehicle_id,
+                          "SampleTime": curr_datetime_iso,
+                          "Position": event['position']
+                      }
+                  ]
+
+                  client_als = boto3.client("location")
+                  response = client_als.batch_update_device_position(
+                      TrackerName=TRACKER_NAME, Updates=updates)
+
+                  response_status = response['ResponseMetadata']['HTTPStatusCode']
+
+                  if response_status == 200:
+                      return_message = "location event routed to amazon location service."
+                  else:
+                      return_message = "error while routing location event to location service"
+
+                  logger.info("RESPONSE: Status code %s received and %s",
+                              response_status, return_message)
+
+                  return {
+                      'statusCode': response_status,
+                      'body': return_message
+                  }
+              else:
+                  logger.error("Event not routed.")
+
+
+      Description: Lambda used for parsing messages
+      FunctionName: vcs-iot-messageparser
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          SecretARN: !Ref SecretARN
+      Layers:
+        - arn:aws:lambda:${AWS::Region}:898466741470:layer:psycopg2-py38:1
+      Runtime: python3.8
+      Role: !GetAtt MessageParserFunctionRole.Arn
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref NoIngressSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+  EventParserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import datetime
+          import psycopg2
+          import json
+          import boto3
+          import logging
+          import sys
+          import time
+          import os
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          SECRET_ID = os.environ['SecretARN']
+
+          client_sm = boto3.client('secretsmanager')
+          response = client_sm.get_secret_value(
+              SecretId=SECRET_ID
+          )
+          db_conn = json.loads(response['SecretString'])
+
+          ENDPOINT = db_conn['host']
+          PORT = db_conn['port']
+          USER = db_conn['username']
+          REGION = os.environ['AWS_REGION']
+          DBNAME = "vcsmaster"
+          DBPWD = db_conn['password']
+
+          # ********* create the connection for the database
+          try:
+              conn = psycopg2.connect(host=ENDPOINT, port=PORT, database=DBNAME, user=USER,
+                                      password=DBPWD)
+          except psycopg2.Error as e:
+              logger.error("Database connection failed due to {}".format(e))
+              logger.error(e)
+              sys.exit()
+
+          logger.info("OUTCOME: Connection to RDS instance succeeded")
+
+
+          def send_email(vinnum, name, city, postalcode):
+
+              SENDER = os.environ['email_identity']
+              RECIPIENT = os.environ['email_identity']
+              AWS_REGION = os.environ['AWS_REGION']
+              SUBJECT = "Notification of Vehicle Arrivals"
+              BODY_TEXT = ("Vehicle with specified vin number test01 has reached the specified address below \r\n"
+                           " frisco, texas"
+                           )
+
+              # The HTML body of the email.
+              BODY_HTML = """<html>
+              <head></head>
+              <body>
+              <p>Dear Customer,</p>
+              <p></p>
+                  <p>Vehicle with vin number <b> %s </b>  has reached the address below.<br>
+                  <u> %s <br> %s, %s </u></p>
+                  <p></p>
+                  <p>Thank you, <br>
+                  VCS Team</p>
+                  <p></p>
+                  <p>Note: Please do not reply to this automated email message. Contact <a href=''>support</a> for any assistance neede.</p>
+              </body>
+              </html>
+                          """ % (vinnum, name, city, postalcode)
+
+              CHARSET = "UTF-8"
+              client = boto3.client('ses', region_name=AWS_REGION)
+
+              try:
+                  response = client.send_email(
+                      Destination={
+                          'ToAddresses': [
+                              RECIPIENT,
+                          ],
+                      },
+                      Message={
+                          'Body': {
+                              'Html': {
+                                  'Charset': CHARSET,
+                                  'Data': BODY_HTML,
+                              },
+                              'Text': {
+                                  'Charset': CHARSET,
+                                  'Data': BODY_TEXT,
+                              },
+                          },
+                          'Subject': {
+                              'Charset': CHARSET,
+                              'Data': SUBJECT,
+                          },
+                      },
+                      Source=SENDER,
+                  )
+              # Display an error if something goes wrong.
+              except ClientError as e:
+                  print(e.response['Error']['Message'])
+              else:
+                  print("Email sent! Message ID:"),
+                  print(response['MessageId'])
+
+
+          def lambda_handler(event, context):
+
+              logger.info('RECEIVED:', event)
+
+              geo_event = event['detail']
+              idata_time = geo_event['SampleTime']
+              idata_geofenceid = geo_event['GeofenceId']
+              idata_vehicleid = geo_event['DeviceId']
+              idata_eventtype = geo_event['EventType']
+              idata_long = geo_event['Position'][0]
+              idata_lat = geo_event['Position'][1]
+              idata_eventid = event['id']
+
+              # ********** Insert the event in the database
+              logger.info('ACTION: Save the geofence event into database')
+              try:
+                  cur = conn.cursor()
+                  iq_01 = """INSERT INTO geofenceevents
+                                  (time, geofenceid, vehicleid, eventtype, latitude, longitude, position, eventid)
+                              VALUES
+                                  (%s, %s, %s, %s, %s, %s, point(%s,%s), %s);"""
+                  cur.execute(iq_01, (idata_time, idata_geofenceid, idata_vehicleid,
+                                      idata_eventtype, idata_lat, idata_long, idata_long, idata_lat, idata_eventid,))
+                  conn.commit()
+              except Exception as e:
+                  logger.error("Geofence event insert error {}".format(e))
+                  conn.rollback()
+
+              try:
+                  iq_02 = """ INSERT INTO vehiclestatus(vehicleid) VALUES (%s);"""
+                  cur.execute(iq_02, (idata_vehicleid,))
+                  conn.commit()
+              except Exception as e:
+                  logger.error("Vehicle insert error {}".format(e))
+                  conn.rollback()
+
+              logger.info('ACTION: Get the dealer for corresponding geofence')
+              sq_01 = """ select dealerid from dealergeofences g where geofenceid = %s """
+              cur.execute(sq_01, (idata_geofenceid,))
+              dealer_records = cur.fetchall()
+
+              if len(dealer_records) > 0:
+                  logger.info('ACTION: Update the vehicle status')
+                  dealer_id = dealer_records[0][0]
+                  raise_exception = False
+                  in_transit = False
+                  if idata_eventtype == 'ENTER':
+                      sq_04 = """ select vin, dealername, dealercity, dealerpostalcode from vehicle_details where vehicleid = %s"""
+                      cur.execute(sq_04, (idata_vehicleid,))
+                      sqr_04 = cur.fetchone()
+                      if sqr_04:
+                          send_email(sqr_04[0], sqr_04[1], sqr_04[2], sqr_04[3])
+
+                      sq_02 = """ select dealerid from dealervehicles where vehicleid = %s"""
+                      cur.execute(sq_02, (idata_vehicleid,))
+                      sqr_02 = cur.fetchone()
+                      if sqr_02:
+
+                          allot_dealer = sqr_02[0]
+
+                          if allot_dealer != dealer_id:
+                              raise_exception = True
+                              try:
+                                  iq_03 = """ INSERT INTO dealerexceptions(
+                                          vehicleid, dealerid, time)
+                                          VALUES (%s, %s, %s); """
+                                  cur.execute(iq_03, (idata_vehicleid,
+                                              dealer_id, idata_time,))
+                                  conn.commit()
+                              except Exception as e:
+                                  logger.error(
+                                      "Vehicle update status error {}".format(e))
+                                  conn.rollback()
+
+                      try:
+                          uq_01 = """ update vehiclestatus set atdealer = %s, intransit = %s , haveexception = %s where vehicleid = %s """
+                          cur.execute(uq_01, (dealer_id, in_transit,
+                                              raise_exception, idata_vehicleid))
+                          conn.commit()
+                      except Exception as e:
+                          logger.error("Vehicle update status error {}".format(e))
+                          conn.rollback()
+
+                  elif idata_eventtype == 'EXIT':
+                      uq_02 = """ update vehiclestatus set atdealer = %s where vehicleid = %s """
+                      cur.execute(uq_02, (None,  idata_vehicleid))
+                      conn.commit()
+
+                      # ********** Insert the event in the database
+
+              response_status = 200
+              return_message = ''
+              return {
+                  'statusCode': response_status,
+                  'body': return_message
+              }
+
+
+      Description: Lambda used for parsing messages
+      FunctionName: vcs-amazon-location-service-eventparser
+      Environment:
+        Variables:
+          SecretARN: !Ref SecretARN
+          email_identity: !Ref EmailId
+      Handler: index.lambda_handler
+      Layers:
+        - arn:aws:lambda:${AWS::Region}:898466741470:layer:psycopg2-py38:1
+      Runtime: python3.8
+      Role: !GetAtt EventParserFunctionRole.Arn
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref NoIngressSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+  IotSimulatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import time
+          import datetime
+          import os
+          runtime_region = os.environ['AWS_REGION']
+          client = boto3.client('iot-data', region_name=runtime_region)
+          curr_datetime = datetime.datetime.utcnow()
+          curr_datetime_iso = curr_datetime.isoformat()
+          transitVehicles = {
+          '401869876': {'vin':'b4e2078b-2a1c-42ff-b8cc-5a66542698ca', 'coordinates': [
+              [-96.81865811347961, 33.07027192165384],
+              [-96.81866884231567, 33.06886035700154]
+            ]},
+          '401848734' : {'vin':'b4e2078b-2a1c-42ff-b8cc-5a66542698ca', 'coordinates': [
+              [-96.71615481376648, 32.976160072356514],
+              [-96.71669125556946, 32.97521502639376],
+              [-96.71714186668396, 32.97449498458644],
+              [-96.71669125556946, 32.97521502639376],
+              [-96.71714186668396, 32.97449498458644]
+            ]}
+           }
+          enterVehicles = {
+          '401869876': {'vin': 'b4e2078b-2a1c-42ff-b8cc-5a66542698ca', 'coordinates': [
+              [-96.81865811347961, 33.067223992568664],
+              [-96.81903362274169, 33.066684525097415],
+              [-96.81945204734802, 33.06725096585542],
+              [-96.82041764259338, 33.06730491240415],
+              [-96.82165145874023, 33.06731390349237]
+            ]},
+          '401848734': {'vin': 'b4e2078b-2a1c-42ff-b8cc-5a66542698ca', 'coordinates': [
+              [-96.7190408706665, 32.973657928606265],
+              [-96.71915888786316, 32.9731718924609],
+              [-96.7198133468628, 32.972703855126255]
+            ]}
+          }
+          exitVehicles = {
+          '401869876': {'vin': 'b4e2078b-2a1c-42ff-b8cc-5a66542698ca', 'coordinates': [
+              [-96.8230676651001, 33.06703517932991],
+              [-96.82345390319824, 33.06815007068296],
+              [-96.82410836219788, 33.06848273714088],
+              [-96.82414054870605, 33.06950770156399],
+              [-96.82411909103394, 33.07040678333363],
+              [-96.8241512775421, 33.071215949071764],
+              [-96.82410836219788, 33.07238473088975],
+              [-96.82406544685364, 33.0731579164827]
+            ]},
+          '401848734': {'vin': 'b4e2078b-2a1c-42ff-b8cc-5a66542698ca', 'coordinates': [
+              [-96.72067165374756, 32.97230782159811],
+              [-96.72159433364868, 32.971434741411095],
+              [-96.72158360481262, 32.97068766594556],
+              [-96.72160506248474, 32.969823570779184],
+              [-96.72088623046875, 32.96862642496605]
+            ]}
+          }
+
+          def parseMessages(vehicles):
+              for key in vehicles:
+                  coords = vehicles[key]['coordinates']
+                  vin = vehicles[key]['vin']
+                  for values in coords:
+                      device_position_msg = {}
+                      device_position_msg['eventid'] = str(uuid.uuid4())
+                      device_position_msg['vehicleid'] = key
+                      device_position_msg['vin'] = vin
+                      device_position_msg['timestamp'] = curr_datetime_iso
+                      device_position_msg['position'] = values
+                      messageJson = json.dumps(device_position_msg)
+                      response = client.publish(
+                          topic='iot/fleet/location',
+                          qos=1,
+                          payload=messageJson
+                      )
+                      time.sleep(3)
+                      print(response)
+
+
+          def lambda_handler(event, context):
+              parseMessages(transitVehicles)
+              parseMessages(enterVehicles)
+              parseMessages(exitVehicles)
+
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Published to topic')
+              }
+
+      Description: Lambda used for simulating an IoT Device
+      FunctionName: vcs-iot-simulator
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt IotSimulatorFunctionRole.Arn
+      Timeout: 300
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref NoIngressSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+
+Outputs:
+  EventParserArn:
+    Description: A reference to the secret created. Needed for Query Editor
+    Value: !GetAtt EventParserFunction.Arn

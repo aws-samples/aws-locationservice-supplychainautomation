@@ -1,0 +1,46 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: New Template
+Parameters:
+  EventParser:
+    Description: Function ARN of the Event Parser
+    Type: String
+Resources:
+  SupplyChainCollection:
+    Type: AWS::Location::GeofenceCollection
+    Properties:
+      CollectionName: geofencecollection-01
+      Description: Geofence Collection created for the Automated Supply Chain Blog
+  GeofenceRule:
+    Type: AWS::Events::Rule
+    DependsOn: SupplyChainCollection
+    Properties:
+      Description: EventBridge Rule for Amazon Location Service Geofence Events
+      EventPattern:
+        source:
+          - aws.geo
+        detail-type:
+          - "Location Geofence Event"
+      Name: SupplyChainCollectionRule
+      Targets:
+        -
+          Arn: !Ref EventParser
+          Id: 1
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EventParser
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GeofenceRule.Arn
+  SupplyChainTracker:
+    Type: AWS::Location::Tracker
+    Properties:
+      Description: Tracking Resources created for the Supply Chain Blog
+      PositionFiltering: AccuracyBased
+      TrackerName: tracker-01
+      PricingPlan: RequestBasedUsage
+  SupplyChainTrackerConsumer:
+    Type: AWS::Location::TrackerConsumer
+    Properties:
+      ConsumerArn: !GetAtt SupplyChainCollection.Arn
+      TrackerName: tracker-01

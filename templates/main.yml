@@ -1,0 +1,83 @@
+Description:  This template deploys stack sets for a VPC, DB Cluster, and Lambda Functions.
+Parameters:
+  EmailAddress:
+    Description: Email address used for notifications
+    Type: String
+Resources:
+
+  VPCStack:
+      Type: AWS::CloudFormation::Stack
+      Properties:
+        TemplateURL:
+          https://amazon-location-cloudformation-templates.s3.us-west-2.amazonaws.com/SupplyChainAutomation/vpc.yml
+        Parameters:
+          EnvironmentName: DealerTracker
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:
+        https://amazon-location-cloudformation-templates.s3.us-west-2.amazonaws.com/SupplyChainAutomation/dbcluster.yml
+
+      Parameters:
+        PrivateSubnetA:
+          Fn::GetAtt:
+          - VPCStack
+          - Outputs.PrivateSubnet1
+        PrivateSubnetB:
+          Fn::GetAtt:
+          - VPCStack
+          - Outputs.PrivateSubnet2
+        VPCId:
+          Fn::GetAtt:
+          - VPCStack
+          - Outputs.VPC
+        NoIngressSecurityGroup:
+          Fn::GetAtt:
+            - VPCStack
+            - Outputs.NoIngressSecurityGroup
+  EmailStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:
+        https://amazon-location-cloudformation-templates.s3.us-west-2.amazonaws.com/SupplyChainAutomation/ses.yml
+      Parameters:
+        EmailAddress: !Ref EmailAddress
+
+  LambdaStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:
+        https://amazon-location-cloudformation-templates.s3.us-west-2.amazonaws.com/SupplyChainAutomation/lambda.yml
+      Parameters:
+        SecretARN:
+          Fn::GetAtt:
+            - DatabaseStack
+            - Outputs.SecretARN
+        EmailId:
+          Fn::GetAtt:
+            - EmailStack
+            - Outputs.SESEmailIdentity
+        PrivateSubnetA:
+          Fn::GetAtt:
+            - VPCStack
+            - Outputs.PrivateSubnet1
+        PrivateSubnetB:
+          Fn::GetAtt:
+            - VPCStack
+            - Outputs.PrivateSubnet2
+        NoIngressSecurityGroup:
+          Fn::GetAtt:
+            - VPCStack
+            - Outputs.NoIngressSecurityGroup
+
+
+  LocationStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL:
+        https://amazon-location-cloudformation-templates.s3.us-west-2.amazonaws.com/SupplyChainAutomation/location.yml
+      Parameters:
+        EventParser:
+          Fn::GetAtt:
+            - LambdaStack
+            - Outputs.EventParserArn
